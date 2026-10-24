@@ -119,6 +119,108 @@ OCI 子网: 10.0.0.0/24（已通过 IMDS 确认；VCN CIDR 以控制台为准）
 
 完成以上配置后，容器之间可以互通。但 `lxc-net` 默认的 `MASQUERADE` 会把跨子网流量的源 IP 改写成宿主机 IP，这正是本脚本要解决的问题。
 
+## IPv6（可选）
+
+OCI 的 IPv6 不是实例创建后自动就有的。顺序是：**VCN 启用 IPv6 → 子网分配 /64 → VNIC 分配 IPv6 地址或 IPv6 CIDR 前缀 → 实例 OS 配置 → LXC 配置**。
+
+如果目标是让每个 LXC 容器都有可路由的 IPv6，并且保留容器真实源地址，推荐“前缀路由”而不是 NAT66：
+
+- 给每台宿主机的 VNIC 分配一个 IPv6 CIDR 前缀（例如 `/80`）
+- 把这个前缀配置到 `lxcbr0`
+- 容器使用该前缀内的静态地址
+- 两台宿主机互相添加对端 LXC 前缀的静态路由
+
+### 1. OCI 侧
+
+1. **VCN 启用 IPv6**
+   - Networking → Virtual Cloud Networks → 选择 VCN → Edit → Add IPv6 prefix。
+   - 可以让 Oracle 分配 `/56` GUA，也可以使用 ULA 或 BYOIPv6。
+   - IPv6 启用后不能关闭。
+
+2. **子网启用 IPv6**
+   - 选择子网 → Edit → Add IPv6 prefix，分配一个 `/64`。
+   - 需要公网访问：使用 GUA，并把子网设为 Public Subnet。
+   - 只内网：使用 ULA 或 Private Subnet。
+
+3. **给实例 VNIC 分配 IPv6**
+   - Compute → Instances → 实例 → Networking → Attached VNICs → VNIC → IP administration → Assign IPv6 address。
+   - 宿主机自身管理地址：`CIDR prefix length` 留空，得到一个 `/128`。
+   - 给 LXC 用的前缀：填写 `CIDR prefix length`，例如 `80`，得到一个 `/80`。
+   - 掩码范围是 `80–128`，且必须能被 4 整除；不要占用子网第一个和最后一个 `/80`。
+   - 把 `/80` 分配给 VNIC 后，OCI 会把整个 `/80` 路由到这个 VNIC，不需要再为它加 VCN 路由规则。
+   - 如果控制台没有 IPv6 CIDR 选项，可能是子网创建较早，需要重建子网或提 SR。
+
+4. **路由和安全规则**
+   - 公网 IPv6：VCN 路由表添加 `::/0 -> Internet Gateway`。
+   - 安全列表 / NSG 放行需要的 IPv6 流量，例如 `::/0`，或只放行两个 LXC 前缀。
+   - OCI 的 IPv6 路由规则只能指向 Internet Gateway、LPG、DRG，不能像 IPv4 那样指向私有 IP。因此 LXC 前缀必须作为 IPv6 CIDR 直接分配给 VNIC，不能靠 VCN 路由表指到宿主机私有 IP。
+
+5. **实例 OS**
+   - 如果 VNIC 只分配了 `/128`，可以用 DHCPv6 获取：
+     ```bash
+     dhclient -6 ens3
+     ```
+   - 如果分配了 IPv6 CIDR 前缀，需要在 OS 里把前缀配置到 `lxcbr0`，见下一节。
+
+### 2. LXC 侧
+
+假设 OCI 子网是 `2001:db8:1234:5678::/64`，两台宿主机的 VNIC 各分配一个 `/80`，并且 `ens3` 已经配置了 VNIC 的 `/128`：
+
+```text
+宿主机 A VNIC: 2001:db8:1234:5678::a/128
+               2001:db8:1234:5678:1000::/80
+宿主机 B VNIC: 2001:db8:1234:5678::b/128
+               2001:db8:1234:5678:2000::/80
+```
+
+宿主机 A：
+
+```bash
+sysctl -w net.ipv6.conf.all.forwarding=1
+ip -6 addr add 2001:db8:1234:5678:1000::1/80 dev lxcbr0
+ip -6 route add 2001:db8:1234:5678:2000::/80 via 2001:db8:1234:5678::b dev ens3
+```
+
+宿主机 B：
+
+```bash
+sysctl -w net.ipv6.conf.all.forwarding=1
+ip -6 addr add 2001:db8:1234:5678:2000::1/80 dev lxcbr0
+ip -6 route add 2001:db8:1234:5678:1000::/80 via 2001:db8:1234:5678::a dev ens3
+```
+
+容器配置（LXC 5.0）：
+
+```ini
+lxc.net.0.ipv6.address = 2001:db8:1234:5678:1000::2/80
+lxc.net.0.ipv6.gateway = 2001:db8:1234:5678:1000::1
+```
+
+重启并验证：
+
+```bash
+lxc restart lxc-001
+lxc exec lxc-001 -- ip -6 addr show eth0
+lxc exec lxc-001 -- ip -6 route show
+lxc exec lxc-001 -- ping -6 -c 3 2001:db8:1234:5678:2000::2
+```
+
+如果容器内用 systemd-networkd，也可以在 `/etc/systemd/network/eth0.network` 里写 `Address=` 和 `Gateway=`，但不要同时让 LXC 和 systemd-networkd 配同一个地址。
+
+### 3. 持久化和防火墙
+
+- 把 `net.ipv6.conf.all.forwarding=1` 写入 `/etc/sysctl.d/99-lxc-ipv6.conf`。
+- `lxcbr0` 的 IPv6 地址和跨主机路由要持久化到 systemd-networkd、`/etc/network/interfaces` 或一个 oneshot service。
+- 检查 nftables / ip6tables 的 forward 链是否放行两个 LXC 前缀。
+- 两个 VNIC 仍建议关闭源/目的检查（`skipSourceDestCheck=true`），特别是宿主机要转发对端 LXC 前缀时。
+
+### 4. 注意事项
+
+- 只给 VNIC 分配一个 `/128`，这个地址只能给宿主机自己用；要让整个 LXC 网段可路由，必须分配 IPv6 CIDR 前缀。
+- OCI 子网固定 `/64`，不能给每台实例一个 `/64`；所以 LXC 不能用标准 SLAAC `/64`，建议静态地址或 DHCPv6 从 `/80` 前缀分配。
+- 如果只需要容器出站 IPv6、不要求保留源地址，可以用 ULA + NAT66；但这和本项目“保留真实源 IP”的目标相反。
+- Always Free 实例本身可以使用 IPv6，但是否出现 IPv6 选项取决于区域、镜像和 VCN 配置；以控制台为准。
+
 ## 问题现象
 
 两台 OCI 宿主机上的 LXC 子网通过静态路由互通后，容器之间可以 ping 通，但 B 侧应用看到的来源 IP 是主机 A 的 `10.0.0.87`，而不是容器 A 的 `10.2.0.2`。
